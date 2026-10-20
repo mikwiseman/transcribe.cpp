@@ -26,7 +26,10 @@ namespace transcribe {
 class PhraseBoost {
   public:
     // Builds the automaton. Empty phrases are ignored; duplicates merge.
-    // `score` is in logit units (natural log), applied per matched token.
+    // `score` is in logit units (natural log), applied per matched token after
+    // a term's first one: the first piece is often a short, common word start,
+    // and a bonus there rewrites ordinary words. A term is completed once the
+    // model has begun it, and nothing is started for it.
     void build(const std::vector<std::vector<int32_t>> & phrases, float score);
 
     bool empty() const { return nodes_.size() <= 1; }
