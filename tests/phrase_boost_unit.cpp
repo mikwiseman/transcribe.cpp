@@ -39,13 +39,15 @@ int main(void) {
     transcribe::PhraseBoost b;
     b.build({ { 1, 2, 3 }, { 2, 4 }, {}, { 1, 2, 3 } }, 1.0f);
 
-    // Each matched token earns the score; an unrelated token earns nothing.
-    expect("start a term", b.delta(transcribe::PhraseBoost::root, 1), 1.0f);
+    // A term's first piece earns nothing; each later matched piece earns the
+    // score; an unrelated token earns nothing.
+    expect("start a term", b.delta(transcribe::PhraseBoost::root, 1), 0.0f);
+    expect("continue a term", b.delta(b.next(transcribe::PhraseBoost::root, 1), 2), 1.0f);
     expect("unrelated from root", b.delta(transcribe::PhraseBoost::root, 9), 0.0f);
-    expect("complete term", walk(b, { 1, 2, 3 }), 3.0f);
+    expect("complete term", walk(b, { 1, 2, 3 }), 2.0f);
 
     // A completed term keeps its bonus whatever follows.
-    expect("completed then unrelated", walk(b, { 1, 2, 3, 9, 9 }), 3.0f);
+    expect("completed then unrelated", walk(b, { 1, 2, 3, 9, 9 }), 2.0f);
 
     // A broken match gives back exactly what it had earned.
     expect("broken match", walk(b, { 1, 2, 9 }), 0.0f);
@@ -54,8 +56,8 @@ int main(void) {
     // Falling back keeps the suffix that still matches another term:
     // 1 2 then 4 completes {2, 4} through the failure link.
     int state = 0;
-    expect("suffix completes another term", walk(b, { 1, 2, 4 }, &state), 2.0f);
-    expect("and keeps it", walk(b, { 1, 2, 4, 9 }), 2.0f);
+    expect("suffix completes another term", walk(b, { 1, 2, 4 }, &state), 1.0f);
+    expect("and keeps it", walk(b, { 1, 2, 4, 9 }), 1.0f);
 
     // apply() adds exactly delta() to each non-blank token and leaves blank.
     int s12 = 0;

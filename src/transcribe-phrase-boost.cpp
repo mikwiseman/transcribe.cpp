@@ -39,7 +39,7 @@ void PhraseBoost::build(const std::vector<std::vector<int32_t>> & phrases, float
             if (next < 0) {
                 next = static_cast<int>(nodes_.size());
                 Node node;
-                node.earned = nodes_[static_cast<size_t>(state)].earned + score;
+                node.earned = nodes_[static_cast<size_t>(state)].earned + (state == root ? 0.0f : score);
                 nodes_.push_back(node);
                 end.push_back(false);
                 auto & c = nodes_[static_cast<size_t>(state)].children;

@@ -31,8 +31,9 @@ Parakeet has no prompt slot, so its transducer decoders take vocabulary terms
 as phrase boosting: each term is tokenized the way the model writes it, starting
 at a word boundary, and the terms form an Aho-Corasick automaton over token
 ids. The model alone decides between blank and a token on every greedy step;
-when it emits a token, the vocabulary re-ranks the non-blank tokens: a token
-that extends a partial match earns a logit bonus (3.0 by default, chosen on a held-out term set without raising FLEURS WER), a token that breaks one gives back what the unfinished
+when it emits a token, the vocabulary re-ranks the non-blank tokens: once the
+model has begun a term on its own, each further piece that extends the match
+earns a logit bonus (3.0 by default, chosen on a held-out term set without raising FLEURS WER), a token that breaks one gives back what the unfinished
 match earned, and a completed term keeps its bonus. Biasing therefore changes
 which word is written, never whether one is, so it cannot invent speech on
 silence. The reported token confidences stay the model's own, and with no
