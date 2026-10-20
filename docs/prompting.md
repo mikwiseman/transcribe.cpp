@@ -30,11 +30,13 @@ note under [`models/`](models/).
 Parakeet has no prompt slot, so its transducer decoders take vocabulary terms
 as phrase boosting: each term is tokenized the way the model writes it, starting
 at a word boundary, and the terms form an Aho-Corasick automaton over token
-ids. On every greedy step a token that extends a partial match earns a logit
-bonus (3.0 by default, chosen on a held-out term set without raising FLEURS WER), a token that breaks one gives back what the unfinished
-match earned, and a completed term keeps its bonus. Blank is never adjusted and
-the reported token confidences stay the model's own, so with no terms decoding
-is bit-exact. Terms with characters the tokenizer cannot write are skipped
+ids. The model alone decides between blank and a token on every greedy step;
+when it emits a token, the vocabulary re-ranks the non-blank tokens: a token
+that extends a partial match earns a logit bonus (3.0 by default, chosen on a held-out term set without raising FLEURS WER), a token that breaks one gives back what the unfinished
+match earned, and a completed term keeps its bonus. Biasing therefore changes
+which word is written, never whether one is, so it cannot invent speech on
+silence. The reported token confidences stay the model's own, and with no
+terms decoding is bit-exact. Terms with characters the tokenizer cannot write are skipped
 with a WARN. Offline runs and batches take terms; streaming ignores them, and
 CTC heads do not take them yet.
 
