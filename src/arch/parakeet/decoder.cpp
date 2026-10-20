@@ -13,6 +13,8 @@
 
 #include "decoder.h"
 
+#include <limits>
+
 #include "parakeet.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
@@ -978,19 +980,28 @@ int argmax_range(const float * data, int n) {
 // The result lives in [0, 1] modulo the +1e-10 epsilon (which
 // matches the reference verbatim, including its slight
 // negative-bias for nearly-uniform distributions).
-// Token argmax, biased toward the vocabulary when there is one. The model's
-// own logits are left untouched for the confidence that follows.
+// Token argmax, biased toward the vocabulary when there is one.
+//
+// The model alone decides between blank and a token: only when its own
+// argmax emits something does the vocabulary re-rank the non-blank tokens.
+// Biasing can then change which word is written but never whether one is,
+// so it cannot invent speech on silence or noise. The model's own logits are
+// left untouched for the confidence that follows.
 static int biased_argmax(const float *                   token_logits,
                          int                             n_token_cls,
                          int                             blank_id,
                          const transcribe::PhraseBoost * boost,
                          int                             boost_state,
                          std::vector<float> &            scratch) {
-    if (boost == nullptr || boost->empty()) {
-        return argmax_range(token_logits, n_token_cls);
+    const int unbiased = argmax_range(token_logits, n_token_cls);
+    if (boost == nullptr || boost->empty() || unbiased == blank_id) {
+        return unbiased;
     }
     scratch.assign(token_logits, token_logits + n_token_cls);
     boost->apply(boost_state, scratch.data(), n_token_cls, blank_id);
+    if (blank_id >= 0 && blank_id < n_token_cls) {
+        scratch[static_cast<size_t>(blank_id)] = -std::numeric_limits<float>::infinity();
+    }
     return argmax_range(scratch.data(), n_token_cls);
 }
 
