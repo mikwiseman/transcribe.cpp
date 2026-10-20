@@ -818,7 +818,7 @@ static double parakeet_ms_per_enc_frame(const ParakeetHParams & hp) {
 // Logit bonus per matched vocabulary token, in natural-log units. Chosen on
 // the dev half of a term-recall set and checked against general WER; see
 // docs/prompting.md. TRANSCRIBE_VOCABULARY_BOOST overrides it for research.
-constexpr float kVocabularyBoost = 3.0f;
+constexpr float kVocabularyBoost = 8.0f;
 
 static float vocabulary_boost_score() {
     if (const char * v = transcribe::env::str("TRANSCRIBE_VOCABULARY_BOOST")) {
