@@ -141,6 +141,18 @@ transcribe_status pause_segments(int64_t                n_samples,
     }
     const int64_t cap_samples = samples_for(p.max_segment_seconds, p.sample_rate);
 
+    // Before a piece is dropped as silent, ask the speech source about that
+    // piece on its own. Speech scored over a whole block is judged against
+    // everything else in it: speech 40 dB quieter than a neighbour in the
+    // same block can score as silence there and as speech by itself, and a
+    // piece dropped on the block's word is lost from the transcript.
+    const auto heard_alone = [&](int64_t start, int64_t len, bool & heard) {
+        Regions                 alone;
+        const transcribe_status st = speech(start, len, alone);
+        heard                      = has_speech(alone, static_cast<double>(len) / rate);
+        return st;
+    };
+
     // The carry is [consumed, consumed + carry_len) of the file; regions
     // are relative to its start.
     Regions regions;
@@ -163,7 +175,12 @@ transcribe_status pause_segments(int64_t                n_samples,
             const double  cut     = next_cut(pauses_from_speech(regions, static_cast<double>(carry_len) / rate, p), p);
             const int64_t index   = round_half_even(cut * rate);
             const double  seconds = static_cast<double>(index) / rate;
-            if (has_speech(regions, seconds)) {
+            bool          keep    = has_speech(regions, seconds);
+            if (const transcribe_status st = keep ? TRANSCRIBE_OK : heard_alone(consumed, index, keep);
+                st != TRANSCRIBE_OK) {
+                return st;
+            }
+            if (keep) {
                 out.push_back({ consumed, index });
             }
             consumed += index;
@@ -180,9 +197,18 @@ transcribe_status pause_segments(int64_t                n_samples,
     }
     // A remainder too short to normalize, or with no speech, left behind by
     // a cut carries nothing and is dropped.
-    if (cuts > 0 &&
-        (carry_len < p.min_feature_samples || !has_speech(regions, static_cast<double>(carry_len) / rate))) {
-        return TRANSCRIBE_OK;
+    if (cuts > 0) {
+        if (carry_len < p.min_feature_samples) {
+            return TRANSCRIBE_OK;
+        }
+        bool keep = has_speech(regions, static_cast<double>(carry_len) / rate);
+        if (const transcribe_status st = keep ? TRANSCRIBE_OK : heard_alone(consumed, carry_len, keep);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (!keep) {
+            return TRANSCRIBE_OK;
+        }
     }
     out.push_back({ consumed, carry_len });
     return TRANSCRIBE_OK;

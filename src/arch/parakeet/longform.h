@@ -6,7 +6,10 @@
 // lies inside (min_segment_seconds, max_segment_seconds) of the running
 // carry, else at the cap; segments are contiguous, never overlap, and a
 // segment with no speech is skipped. Speech regions come from the VAD head,
-// scanned one block of scan_block_seconds at a time.
+// scanned one block of scan_block_seconds at a time. A segment the block's
+// scan calls silent is scanned again on its own before it is skipped, since
+// quiet speech next to loud speech in one block can score as silence there.
+// That second look is the only departure from the Python reference.
 //
 // All time arithmetic is float64 and cut indices use round-half-to-even,
 // as in the Python reference, so cut points match sample for sample.

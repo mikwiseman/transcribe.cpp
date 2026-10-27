@@ -223,6 +223,44 @@ int main() {
         check(same, label);
     }
 
+    // Quiet speech next to loud speech in one scan block: the block's scan
+    // hears only the loud part, a scan of the quiet part alone hears it. This
+    // is what the VAD head did on 33.13 s of FLEURS en_us test audio whose
+    // first three utterances are about 40 dB below the fourth: without a
+    // second look the first 12.4 s were dropped.
+    {
+        const int64_t     n_samples = 530080;  // 33.13 s
+        const double      loud      = 24.13;
+        const lf::Regions quiet     = {
+            { 0.0,   5.95  },
+            { 6.45,  12.09 },
+            { 12.59, 23.63 }
+        };
+        const lf::SpeechFn speech = [&](int64_t start_sample, int64_t len, lf::Regions & regions) {
+            const double start = static_cast<double>(start_sample) / p.sample_rate;
+            const double end   = start + static_cast<double>(len) / p.sample_rate;
+            regions.clear();
+            if (end > loud) {  // the block holds the loud speaker: only it scores
+                regions.emplace_back(std::max(loud, start) - start, end - start);
+                return TRANSCRIBE_OK;
+            }
+            for (const auto & r : quiet) {
+                if (r.second > start && r.first < end) {
+                    regions.emplace_back(std::max(r.first, start) - start, std::min(r.second, end) - start);
+                }
+            }
+            return TRANSCRIBE_OK;
+        };
+        std::vector<lf::Segment> segs;
+        check(lf::pause_segments(n_samples, p, speech, segs) == TRANSCRIBE_OK, "quiet speech: status");
+        int64_t covered = 0;
+        for (const auto & sg : segs) {
+            check(sg.start == covered, "quiet speech: segments are contiguous from the start");
+            covered = sg.start + sg.n_samples;
+        }
+        check(segs.size() == 2 && covered == n_samples, "quiet speech next to loud speech is not dropped");
+    }
+
     if (g_failures == 0) {
         std::printf("parakeet longform unit: OK\n");
     }
