@@ -3,7 +3,10 @@
 // Predictor (2-layer LSTM) + joint network forward + greedy decode
 // driver (TDT, RNN-T, CTC heads).
 //
-// Execution model: the decoder runs entirely as ggml graphs on ONE
+// Execution model: on Apple the per-step products run on Accelerate
+// (decoder.cpp, "Decoder steps on BLAS"), reading the same resident
+// weights. Everywhere else, and whenever a weight is not host memory,
+// the decoder runs entirely as ggml graphs on ONE
 // shared, per-decode CPU threadpool — predictor LSTM (per-step graph),
 // per-utterance encoder projection (one GEMM), and joint network (one
 // graph). PredGraph owns the backend and threadpool; enc_proj and joint

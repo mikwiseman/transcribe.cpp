@@ -838,6 +838,33 @@ const float * predictor_step_ggml(const HostPredictor & predictor,
     return new_state.h.back().data();
 }
 
+// log_softmax over the full joint output matches NeMo's CPU-inference
+// representation of joint_after_projection. It is a uniform per-row
+// shift, so it leaves token/duration argmax AND token_confidence
+// (which re-softmaxes the token sub-range) invariant — the decode
+// output is bit-identical with or without it. It is only needed to
+// make the dec.joint.0 dump element-wise comparable to NeMo's
+// normalized reference, so it does nothing unless dumping.
+void normalize_joint_for_dump(const HostJoint & j, std::vector<float> & out_logits) {
+    if (!transcribe::debug::enabled()) {
+        return;
+    }
+    float max_v = out_logits[0];
+    for (int i = 1; i < j.joint_n; ++i) {
+        if (out_logits[i] > max_v) {
+            max_v = out_logits[i];
+        }
+    }
+    double sum = 0.0;
+    for (int i = 0; i < j.joint_n; ++i) {
+        sum += std::exp(static_cast<double>(out_logits[i] - max_v));
+    }
+    const float log_sum = static_cast<float>(std::log(sum)) + max_v;
+    for (int i = 0; i < j.joint_n; ++i) {
+        out_logits[i] -= log_sum;
+    }
+}
+
 // Run the joint network for one decode step.
 //
 // `enc_proj` is the precomputed encoder projection for this frame
@@ -868,29 +895,7 @@ bool joint_step(const HostJoint &    j,
     }
     ggml_backend_tensor_get(g.logits, out_logits.data(), 0, static_cast<size_t>(j.joint_n) * sizeof(float));
 
-    // log_softmax over the full joint output matches NeMo's CPU-inference
-    // representation of joint_after_projection. It is a uniform per-row
-    // shift, so it leaves token/duration argmax AND token_confidence
-    // (which re-softmaxes the token sub-range) invariant — the decode
-    // output is bit-identical with or without it. It is only needed to
-    // make the dec.joint.0 dump element-wise comparable to NeMo's
-    // normalized reference, so skip it unless dumping.
-    if (transcribe::debug::enabled()) {
-        float max_v = out_logits[0];
-        for (int i = 1; i < j.joint_n; ++i) {
-            if (out_logits[i] > max_v) {
-                max_v = out_logits[i];
-            }
-        }
-        double sum = 0.0;
-        for (int i = 0; i < j.joint_n; ++i) {
-            sum += std::exp(static_cast<double>(out_logits[i] - max_v));
-        }
-        const float log_sum = static_cast<float>(std::log(sum)) + max_v;
-        for (int i = 0; i < j.joint_n; ++i) {
-            out_logits[i] -= log_sum;
-        }
-    }
+    normalize_joint_for_dump(j, out_logits);
     return true;
 }
 
@@ -949,6 +954,261 @@ bool precompute_enc_proj_ggml(const HostJoint &    j,
     ggml_free(ctx);
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Decoder steps on BLAS
+// ---------------------------------------------------------------------------
+//
+// One greedy step is four matrix-vector products through the predictor LSTM
+// and two through the joint, all at n = 1, where ggml's mul_mat is a plain
+// dot-product loop (tinyBLAS needs n >= 2). Measured on an M4 Pro with the
+// 0.6B TDT model: 0.77 ms a step through the graphs, 0.28 ms through
+// cblas_sgemv on the same resident fp32 weights. The step is the whole of a
+// decode, so a 16 s utterance spends about 30 ms in it instead of 85.
+//
+// Same weights, same operations in the same order as the graphs. Only the
+// order of additions inside each product differs, so logits agree to rounding
+// and not bit for bit.
+//
+// Apple only, because Accelerate is the one BLAS measured here. Taken when
+// every weight is host fp32 memory, which the CPU-backend weight buffers
+// always are; anything else keeps the graphs.
+#if TRANSCRIBE_HAS_BLAS && defined(__APPLE__)
+#    define PARAKEET_BLAS_STEP 1
+#else
+#    define PARAKEET_BLAS_STEP 0
+#endif
+
+#if PARAKEET_BLAS_STEP
+
+// Host pointer to a resident fp32 weight; nullptr when it is not host memory.
+const float * host_f32(const ggml_tensor * t) {
+    if (t == nullptr || t->type != GGML_TYPE_F32 || t->buffer == nullptr || t->data == nullptr ||
+        !ggml_backend_buffer_is_host(t->buffer)) {
+        return nullptr;
+    }
+    return static_cast<const float *>(t->data);
+}
+
+struct BlasStep {
+    struct Layer {
+        const float * Wx = nullptr;  // row-major [4H, H]
+        const float * Wh = nullptr;  // row-major [4H, H]
+        const float * b  = nullptr;  // [4H]
+    };
+    std::vector<Layer> lstm;
+    const float *      enc_w  = nullptr;  // row-major [joint_h, d_enc]
+    const float *      enc_b  = nullptr;  // [joint_h]
+    const float *      pred_w = nullptr;  // row-major [joint_h, pred_hidden]
+    const float *      pred_b = nullptr;  // [joint_h]
+    const float *      out_w  = nullptr;  // row-major [joint_n, joint_h]
+    const float *      out_b  = nullptr;  // [joint_n]
+    std::vector<float> gates;             // [4H] scratch
+    std::vector<float> recur;             // [4H] scratch
+    std::vector<float> act;               // [joint_h] scratch
+    bool               ready = false;
+};
+
+// Point `s` at the resident weights. False when any of them is missing or
+// lives somewhere a host pointer cannot reach, or the activation is one the
+// loader's allow-list does not hold.
+bool bind_blas_step(BlasStep & s, const HostDecoderWeights & w) {
+    const HostPredictor & p = w.predictor;
+    const HostJoint &     j = w.joint;
+    if (!p.lstm_ready || !j.w_ready || p.pred_hidden <= 0 || p.lstm.empty() || j.joint_h <= 0 || j.joint_n <= 0 ||
+        j.pred_hidden != p.pred_hidden) {
+        return false;
+    }
+    if (j.activation != "relu" && j.activation != "sigmoid" && j.activation != "tanh") {
+        return false;
+    }
+    s.lstm.clear();
+    for (const auto & lh : p.lstm) {
+        BlasStep::Layer layer;
+        layer.Wx = host_f32(lh.g_Wx);
+        layer.Wh = host_f32(lh.g_Wh);
+        layer.b  = host_f32(lh.g_b);
+        if (layer.Wx == nullptr || layer.Wh == nullptr || layer.b == nullptr) {
+            return false;
+        }
+        s.lstm.push_back(layer);
+    }
+    s.enc_w  = host_f32(j.g_enc_w);
+    s.enc_b  = host_f32(j.g_enc_b);
+    s.pred_w = host_f32(j.g_pred_w);
+    s.pred_b = host_f32(j.g_pred_b);
+    s.out_w  = host_f32(j.gw_w);
+    s.out_b  = host_f32(j.gw_b);
+    if (s.enc_w == nullptr || s.enc_b == nullptr || s.pred_w == nullptr || s.pred_b == nullptr ||
+        s.out_w == nullptr || s.out_b == nullptr) {
+        return false;
+    }
+    s.gates.assign(static_cast<size_t>(4 * p.pred_hidden), 0.0f);
+    s.recur.assign(static_cast<size_t>(4 * p.pred_hidden), 0.0f);
+    s.act.assign(static_cast<size_t>(j.joint_h), 0.0f);
+    s.ready = true;
+    return true;
+}
+
+// predictor_step_ggml without the graph. Same contract.
+const float * predictor_step_blas(const HostPredictor & predictor,
+                                  BlasStep &            s,
+                                  int                   last_token,
+                                  const LstmState &     prev_state,
+                                  LstmState &           new_state,
+                                  std::vector<float> &  scratch_x) {
+#    pragma STDC FP_CONTRACT OFF
+    const int H = predictor.pred_hidden;
+    if (static_cast<int>(scratch_x.size()) < H) {
+        scratch_x.resize(static_cast<size_t>(H));
+    }
+    if (last_token < 0) {
+        std::fill_n(scratch_x.data(), H, 0.0f);
+    } else {
+        const size_t row_off = static_cast<size_t>(last_token) * static_cast<size_t>(H);
+        std::memcpy(scratch_x.data(), predictor.embed_w.data() + row_off, static_cast<size_t>(H) * sizeof(float));
+    }
+
+    // gates = (Wx@x + Wh@h_prev) + b; split [i,f,g,o]; c' = f*c + i*g;
+    // h' = o*tanh(c'). The graph's association, term for term.
+    const float * in = scratch_x.data();
+    float *       ga = s.gates.data();
+    float *       re = s.recur.data();
+    for (size_t l = 0; l < s.lstm.size(); ++l) {
+        const BlasStep::Layer & w  = s.lstm[l];
+        const float *           hp = prev_state.h[l].data();
+        const float *           cp = prev_state.c[l].data();
+        float *                 hn = new_state.h[l].data();
+        float *                 cn = new_state.c[l].data();
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H, 1.0f, w.Wx, H, in, 1, 0.0f, ga, 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, 4 * H, H, 1.0f, w.Wh, H, hp, 1, 0.0f, re, 1);
+        for (int k = 0; k < 4 * H; ++k) {
+            const float sum = ga[k] + re[k];
+            ga[k]           = sum + w.b[k];
+        }
+        for (int k = 0; k < H; ++k) {
+            const float i_ = 1.f / (1.f + expf(-ga[k]));
+            const float f_ = 1.f / (1.f + expf(-ga[H + k]));
+            const float g_ = tanhf(ga[2 * H + k]);
+            const float o_ = 1.f / (1.f + expf(-ga[3 * H + k]));
+            const float fc = f_ * cp[k];
+            const float ig = i_ * g_;
+            const float c_ = fc + ig;
+            cn[k]          = c_;
+            hn[k]          = o_ * tanhf(c_);
+        }
+        in = hn;
+    }
+    return new_state.h.back().data();
+}
+
+// joint_step without the graph. Same contract; the caller applies the dump
+// normalization.
+void joint_step_blas(const HostJoint &    j,
+                     BlasStep &           s,
+                     const float *        enc_proj,
+                     const float *        pred_state,
+                     std::vector<float> & out_logits) {
+#    pragma STDC FP_CONTRACT OFF
+    if (static_cast<int>(out_logits.size()) < j.joint_n) {
+        out_logits.resize(static_cast<size_t>(j.joint_n));
+    }
+    float * act = s.act.data();
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, j.joint_h, j.pred_hidden, 1.0f, s.pred_w, j.pred_hidden, pred_state, 1,
+                0.0f, act, 1);
+    const char kind = j.activation[0];  // 'r'elu, 's'igmoid, 't'anh — checked in bind_blas_step
+    for (int k = 0; k < j.joint_h; ++k) {
+        const float pred_proj = act[k] + s.pred_b[k];
+        const float summed    = enc_proj[k] + pred_proj;
+        act[k] = kind == 'r' ? ((summed > 0.f) ? summed : 0.f) : kind == 's' ? 1.f / (1.f + expf(-summed)) : tanhf(summed);
+    }
+    float * logits = out_logits.data();
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, j.joint_n, j.joint_h, 1.0f, s.out_w, j.joint_h, act, 1, 0.0f, logits, 1);
+    for (int k = 0; k < j.joint_n; ++k) {
+        logits[k] = logits[k] + s.out_b[k];
+    }
+}
+
+// precompute_enc_proj_ggml without the graph: out[T, joint_h] =
+// enc_out[T, d_enc] @ enc_w^T + enc_b.
+void precompute_enc_proj_blas(const HostJoint &    j,
+                              const BlasStep &     s,
+                              const float *        enc_out,
+                              int                  T,
+                              int                  d_enc,
+                              std::vector<float> & out) {
+    const int joint_h = j.joint_h;
+    out.resize(static_cast<size_t>(T) * static_cast<size_t>(joint_h));
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, joint_h, d_enc, 1.0f, enc_out, d_enc, s.enc_w, d_enc, 0.0f,
+                out.data(), joint_h);
+    for (int t = 0; t < T; ++t) {
+        float * row = out.data() + static_cast<size_t>(t) * static_cast<size_t>(joint_h);
+        for (int k = 0; k < joint_h; ++k) {
+            row[k] = row[k] + s.enc_b[k];
+        }
+    }
+}
+
+#endif  // PARAKEET_BLAS_STEP
+
+// What one decode call steps with: BLAS when the weights allow it, the ggml
+// graphs otherwise. Built per decode call, reentrant. `pg` is declared before
+// `jg` so it is destroyed last (jg's buffer lives on pg's backend).
+struct StepEngine {
+    PredGraph  pg;
+    JointGraph jg;
+#if PARAKEET_BLAS_STEP
+    BlasStep blas;
+#endif
+
+    // False is a hard decode error: no BLAS path and the graphs did not build.
+    bool build(const HostDecoderWeights & w, int n_threads) {
+#if PARAKEET_BLAS_STEP
+        if (bind_blas_step(blas, w)) {
+            return true;
+        }
+#endif
+        build_pred_graph(pg, w.predictor, n_threads);
+        if (pg.ready) {
+            build_joint_graph(jg, w.joint, pg.backend);
+        }
+        return pg.ready && jg.ready;
+    }
+
+    bool enc_proj(const HostJoint & j, const float * enc_out, int T, int d_enc, std::vector<float> & out) {
+#if PARAKEET_BLAS_STEP
+        if (blas.ready) {
+            precompute_enc_proj_blas(j, blas, enc_out, T, d_enc, out);
+            return true;
+        }
+#endif
+        return precompute_enc_proj_ggml(j, pg.backend, enc_out, T, d_enc, out);
+    }
+
+    const float * predictor(const HostPredictor & p,
+                            int                   last_token,
+                            const LstmState &     prev_state,
+                            LstmState &           new_state,
+                            std::vector<float> &  scratch_x) {
+#if PARAKEET_BLAS_STEP
+        if (blas.ready) {
+            return predictor_step_blas(p, blas, last_token, prev_state, new_state, scratch_x);
+        }
+#endif
+        return predictor_step_ggml(p, pg, last_token, prev_state, new_state, scratch_x);
+    }
+
+    bool joint(const HostJoint & j, const float * enc_proj, const float * pred_state, std::vector<float> & out_logits) {
+#if PARAKEET_BLAS_STEP
+        if (blas.ready) {
+            joint_step_blas(j, blas, enc_proj, pred_state, out_logits);
+            normalize_joint_for_dump(j, out_logits);
+            return true;
+        }
+#endif
+        return joint_step(j, jg, enc_proj, pred_state, out_logits);
+    }
+};
 
 // Argmax over a contiguous fp32 range. Returns the index of the
 // largest value; ties go to the first occurrence (matches the numpy
@@ -1039,18 +1299,12 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
     const int n_dur       = static_cast<int>(w.tdt_durations.size());
     const int blank_id    = w.blank_id;
 
-    // All-ggml decode on ONE shared threadpool: PredGraph owns the
-    // backend + pool; enc_proj and the joint graph borrow it. pg is
-    // declared first so it is destroyed LAST (jg's buffer lives on pg's
-    // backend). Built per decode call, reentrant. A build failure is a
-    // hard decode error.
-    PredGraph  pg;
-    JointGraph jg;
-    build_pred_graph(pg, w.predictor, nt);
-    if (pg.ready) {
-        build_joint_graph(jg, w.joint, pg.backend);
-    }
-    if (!pg.ready || !jg.ready) {
+    // The steps of this decode: BLAS where the weights allow it, otherwise
+    // the ggml graphs on ONE shared threadpool (PredGraph owns the backend +
+    // pool; enc_proj and the joint graph borrow it). Built per decode call,
+    // reentrant. A build failure is a hard decode error.
+    StepEngine engine;
+    if (!engine.build(w, nt)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: ggml decode graph build failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -1070,7 +1324,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
     const int          joint_h = w.joint.joint_h;
     std::vector<float> enc_proj_all;
     const int64_t      t_enc_proj_start = ggml_time_us();
-    if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc, d_enc, enc_proj_all)) {
+    if (!engine.enc_proj(w.joint, enc_out, T_enc, d_enc, enc_proj_all)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: enc_proj graph failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -1108,7 +1362,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         const int64_t t0 = ggml_time_us();
         const float * decoder_out;
         if (predictor_dirty) {
-            decoder_out = predictor_step_ggml(w.predictor, pg, last_token, state, next_state, scratch_x);
+            decoder_out = engine.predictor(w.predictor, last_token, state, next_state, scratch_x);
             if (decoder_out == nullptr) {
                 return TRANSCRIBE_ERR_BACKEND;
             }
@@ -1120,7 +1374,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
 
         // ----- Joint (using precomputed encoder projection) -----
         const float * enc_proj = enc_proj_all.data() + static_cast<size_t>(step) * static_cast<size_t>(joint_h);
-        if (!joint_step(w.joint, jg, enc_proj, decoder_out, logits)) {
+        if (!engine.joint(w.joint, enc_proj, decoder_out, logits)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
         const int64_t t2 = ggml_time_us();
@@ -1272,14 +1526,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     const int n_token_cls = w.predictor.pred_vocab;  // == vocab + 1
     const int blank_id    = w.blank_id;
 
-    // Per-call decode graphs (see decode_tdt_greedy for the lifecycle).
-    PredGraph  pg;
-    JointGraph jg;
-    build_pred_graph(pg, w.predictor, nt);
-    if (pg.ready) {
-        build_joint_graph(jg, w.joint, pg.backend);
-    }
-    if (!pg.ready || !jg.ready) {
+    // Per-call step engine (see decode_tdt_greedy for the lifecycle).
+    StepEngine engine;
+    if (!engine.build(w, nt)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: ggml decode graph build failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -1293,7 +1542,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     const int          joint_h = w.joint.joint_h;
     std::vector<float> enc_proj_all;
     const int64_t      t_enc_proj_start = ggml_time_us();
-    if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc, d_enc, enc_proj_all)) {
+    if (!engine.enc_proj(w.joint, enc_out, T_enc, d_enc, enc_proj_all)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: enc_proj graph failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -1322,7 +1571,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
         const int64_t t0 = ggml_time_us();
         const float * decoder_out;
         if (predictor_dirty) {
-            decoder_out = predictor_step_ggml(w.predictor, pg, last_token, state, next_state, scratch_x);
+            decoder_out = engine.predictor(w.predictor, last_token, state, next_state, scratch_x);
             if (decoder_out == nullptr) {
                 return TRANSCRIBE_ERR_BACKEND;
             }
@@ -1333,7 +1582,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
         const int64_t t1 = ggml_time_us();
 
         const float * enc_proj = enc_proj_all.data() + static_cast<size_t>(step) * static_cast<size_t>(joint_h);
-        if (!joint_step(w.joint, jg, enc_proj, decoder_out, logits)) {
+        if (!engine.joint(w.joint, enc_proj, decoder_out, logits)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
         const int64_t t2 = ggml_time_us();
@@ -1447,14 +1696,9 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     const int n_token_cls = w.predictor.pred_vocab;
     const int blank_id    = w.blank_id;
 
-    // Per-call decode graphs (see decode_tdt_greedy for the lifecycle).
-    PredGraph  pg;
-    JointGraph jg;
-    build_pred_graph(pg, w.predictor, nt);
-    if (pg.ready) {
-        build_joint_graph(jg, w.joint, pg.backend);
-    }
-    if (!pg.ready || !jg.ready) {
+    // Per-call step engine (see decode_tdt_greedy for the lifecycle).
+    StepEngine engine;
+    if (!engine.build(w, nt)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: ggml decode graph build failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -1475,7 +1719,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     // Precompute encoder projections for this chunk only.
     const int          joint_h = w.joint.joint_h;
     std::vector<float> enc_proj_all;
-    if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc_new, d_enc, enc_proj_all)) {
+    if (!engine.enc_proj(w.joint, enc_out, T_enc_new, d_enc, enc_proj_all)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (rnnt-stream): enc_proj graph failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -1505,7 +1749,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
 
         const float * decoder_out;
         if (predictor_dirty) {
-            decoder_out = predictor_step_ggml(w.predictor, pg, last_token, state, next_state, scratch_x);
+            decoder_out = engine.predictor(w.predictor, last_token, state, next_state, scratch_x);
             if (decoder_out == nullptr) {
                 return TRANSCRIBE_ERR_BACKEND;
             }
@@ -1515,7 +1759,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
         }
 
         const float * enc_proj = enc_proj_all.data() + static_cast<size_t>(step) * static_cast<size_t>(joint_h);
-        if (!joint_step(w.joint, jg, enc_proj, decoder_out, logits)) {
+        if (!engine.joint(w.joint, enc_proj, decoder_out, logits)) {
             return TRANSCRIBE_ERR_BACKEND;
         }
 
